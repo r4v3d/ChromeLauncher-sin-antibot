@@ -1,14 +1,14 @@
 """
 Abre TIDAL en Chrome (ventanas privadas / incógnito) en fases rápidas:
-1) abre todas las ventanas,
-2) rellena correos (emails.txt: el número de ventanas = número de correos en ese archivo),
+1) abre ventanas (agrupando el mismo titular en una sola; lotes de N para no saturar Gmail/OTP),
+2) rellena correos (emails.txt = titulares; filas con el mismo titular se fusionan),
 3) acepta cookies en cada ventana,
 4) pulsa «Continuar» en cada ventana,
 5) rellena contraseñas (passwords.txt, mismo orden que los correos),
 6) pulsa «Inicia sesión» en cada ventana,
 7) abre en cada una la página Familia de TIDAL (account.tidal.com/family).
-8) opcional: elimina del plan Familiar el miembro indicado en el archivo de eliminar miembros
-   (p. ej. eliminar_miembros.txt o «Eliminar miembros.txt» en Windows), misma línea que emails/LINKS;
+8) opcional: elimina del plan Familiar los miembros de eliminar_miembros.txt
+   (misma línea que emails/LINKS; varios miembros del mismo titular se procesan en esa ventana);
    expande la fila si solo se ve nickname, pulsa «Eliminar del plan» y «Confirmar la eliminación».
 
 Tras cada fase (1–8), si se detecta antibot/captcha de TIDAL o error 403 de CloudFront en alguna ventana:
@@ -16,8 +16,9 @@ Tras cada fase (1–8), si se detecta antibot/captcha de TIDAL o error 403 de Cl
   Una vez resueltos, el usuario puede continuar con Enter.
 
 Opcional: --pausa-manual detiene el script hasta Enter (p. ej. para resolver captcha).
+Opcional: --lote-ventanas N (por defecto 5) inicia sesión de N en N ventanas.
 
-Playwright usa un solo Chrome y un contexto aislado por ventana (una por línea de correo en emails.txt).
+Playwright usa un solo Chrome y un contexto aislado por titular único (tras agrupar).
 LINKS.txt es opcional por línea: si hay menos líneas que correos, se usa la URL de login por defecto
 y la etiqueta «Perfil-N» en consola. Si hay más líneas en LINKS que correos, las sobrantes se ignoran.
   python abrir_links_chrome.py --solo-subprocess
@@ -37,6 +38,7 @@ from pathlib import Path
 # URL por defecto: flujo de cuenta (suele pedir inicio de sesión si no hay sesión)
 DEFAULT_TIDAL_LOGIN_URL = "https://account.tidal.com/login"
 DEFAULT_TIDAL_FAMILY_URL = "https://account.tidal.com/family"
+DEFAULT_LOTE_VENTANAS = 5
 
 # Archivos por defecto (misma carpeta que este script)
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -623,6 +625,9 @@ def detectar_error_cloudfront_403(page) -> bool:
 
 
 def _motivo_bloqueo_tid(page) -> str | None:
+    # Contraseña incorrecta no es antibot ni 403: no pedir rotar IP ni recargar.
+    if texto_error_password_incorrecta(page):
+        return None
     if detectar_pantalla_antirobot_tid(page):
         return "antibot"
     if detectar_error_cloudfront_403(page):
@@ -856,11 +861,19 @@ def poner_ventana_al_dia(t, fase_objetivo: str, max_iteraciones: int = 10) -> bo
     
     target_val = orden_fases.get(fase_objetivo, 1)
     
+    if t.get("password_incorrecta"):
+        return False
+
     for iteracion in range(max_iteraciones):
         try:
             if page.is_closed():
                 return False
         except PWErr:
+            return False
+
+        detalle_pwd = texto_error_password_incorrecta(page)
+        if detalle_pwd:
+            marcar_password_incorrecta(t, detalle_pwd)
             return False
             
         # 1. Si hay captcha, error 403 o bloqueo, no podemos avanzar esta ventana aún
@@ -936,6 +949,10 @@ def poner_ventana_al_dia(t, fase_objetivo: str, max_iteraciones: int = 10) -> bo
             if password:
                 rellenar_password_con_reintentos(page, password, intentos=2, fase_rapida=True)
                 pulsar_iniciar_sesion_con_reintentos(page, intentos=2, pausa_s=0.2)
+                detalle_pwd = esperar_error_password_incorrecta(page, timeout_s=3.0)
+                if detalle_pwd:
+                    marcar_password_incorrecta(t, detalle_pwd)
+                    return False
             time.sleep(1.0)  # Tiempo de transición/login
             
         elif current_fase == "iniciar_sesion":
@@ -992,6 +1009,12 @@ def verificar_y_reintentar_fase_anterior(
                 continue
         except PWErr:
             print(f"    [{n}] {perfil}: ❌ Error al acceder a la pestaña")
+            continue
+
+        if t.get("password_incorrecta"):
+            print(
+                f"    [{n}] {perfil}: omitida (contraseña incorrecta; no se reintenta el login)."
+            )
             continue
         
         # Verificar si aún hay bloqueos
@@ -1321,6 +1344,133 @@ def parsear_linea_link(linea: str) -> tuple[str, str]:
     return DEFAULT_TIDAL_LOGIN_URL, linea.strip()
 
 
+def normalizar_email_titular(raw: str) -> str:
+    """
+    Limpia el correo titular: quita espacios y sufijos tipo « - YO» pegados desde Excel.
+    """
+    s = (raw or "").strip()
+    if not s:
+        return ""
+    # Ej.: "correo@gmail.com - YO" → "correo@gmail.com"
+    if " - " in s:
+        izquierda, _derecha = s.rsplit(" - ", 1)
+        if "@" in izquierda.strip():
+            s = izquierda.strip()
+    return s.strip()
+
+
+def gmail_base_sin_puntos(email: str) -> str:
+    """
+    Gmail ignora puntos (y +alias) en el local-part: útil para avisar de misma bandeja OTP.
+    Otros dominios se normalizan solo a minúsculas.
+    """
+    email = normalizar_email_titular(email).casefold()
+    if "@" not in email:
+        return email
+    local, domain = email.split("@", 1)
+    if domain in ("gmail.com", "googlemail.com"):
+        if "+" in local:
+            local = local.split("+", 1)[0]
+        local = local.replace(".", "")
+        return f"{local}@{domain}"
+    return email
+
+
+def miembros_a_eliminar(sesion_o_trabajo: dict) -> list[str]:
+    """Lista de correos a eliminar en una sesión/ventana (soporta clave antigua singular)."""
+    raw = sesion_o_trabajo.get("eliminar_miembros")
+    out: list[str] = []
+    if isinstance(raw, list):
+        for x in raw:
+            m = normalizar_email_titular(str(x)) if x is not None else ""
+            if m and m not in out:
+                out.append(m)
+        return out
+    uno = normalizar_email_titular(str(sesion_o_trabajo.get("eliminar_miembro") or ""))
+    return [uno] if uno else []
+
+
+def partir_en_lotes(items: list, tamano: int) -> list[list]:
+    n = max(1, int(tamano))
+    return [items[i : i + n] for i in range(0, len(items), n)]
+
+
+def agrupar_sesiones_por_titular(sesiones: list[dict]) -> list[dict]:
+    """
+    Fusiona filas con el mismo correo titular (casefold) en una sola sesión.
+    Varios miembros a eliminar quedan en eliminar_miembros[]; una sola ventana / login.
+    """
+    if not sesiones:
+        return []
+
+    agrupadas: list[dict] = []
+    indice_por_email: dict[str, int] = {}
+    filas_antes = len(sesiones)
+
+    for s in sesiones:
+        email = normalizar_email_titular(s.get("email") or "")
+        clave = email.casefold()
+        miembros = miembros_a_eliminar(s)
+        password = (s.get("password") or "").strip()
+
+        if not clave:
+            # Mantener filas sin correo (aviso ya se dio al cargar)
+            nueva = dict(s)
+            nueva["email"] = email
+            nueva["eliminar_miembros"] = miembros
+            nueva["eliminar_miembro"] = miembros[0] if miembros else ""
+            agrupadas.append(nueva)
+            continue
+
+        if clave not in indice_por_email:
+            indice_por_email[clave] = len(agrupadas)
+            nueva = dict(s)
+            nueva["email"] = email
+            nueva["password"] = password
+            nueva["eliminar_miembros"] = list(miembros)
+            nueva["eliminar_miembro"] = miembros[0] if miembros else ""
+            agrupadas.append(nueva)
+            continue
+
+        dest = agrupadas[indice_por_email[clave]]
+        for m in miembros:
+            if m not in dest["eliminar_miembros"]:
+                dest["eliminar_miembros"].append(m)
+        dest["eliminar_miembro"] = dest["eliminar_miembros"][0] if dest["eliminar_miembros"] else ""
+        if password and not (dest.get("password") or "").strip():
+            dest["password"] = password
+        elif password and (dest.get("password") or "").strip() and password != dest["password"]:
+            print(
+                f"Aviso: titular «{email}» tiene contraseñas distintas en filas repetidas; "
+                "se usa la de la primera fila."
+            )
+
+    if len(agrupadas) < filas_antes:
+        miembros_totales = sum(len(miembros_a_eliminar(s)) for s in agrupadas)
+        print(
+            f"Agrupación por titular: {filas_antes} fila(s) → {len(agrupadas)} ventana(s) "
+            f"({miembros_totales} miembro(s) a eliminar en total). "
+            "Mismo titular = una sola ventana."
+        )
+
+    # Aviso si varios titulares distintos caen en la misma bandeja Gmail (puntos)
+    bandejas: dict[str, list[str]] = {}
+    for s in agrupadas:
+        email = s.get("email") or ""
+        if not email:
+            continue
+        base = gmail_base_sin_puntos(email)
+        bandejas.setdefault(base, []).append(email)
+    mismas = {b: emails for b, emails in bandejas.items() if len(set(e.casefold() for e in emails)) > 1}
+    if mismas:
+        print(
+            "Aviso: hay titulares distintos que comparten bandeja Gmail (puntos/alias). "
+            f"Se iniciará sesión en lotes para no saturar OTP ({len(mismas)} bandeja(s) compartida(s))."
+        )
+
+    return agrupadas
+
+
 def cargar_sesiones(
     links_path: Path,
     emails_path: Path,
@@ -1328,6 +1478,7 @@ def cargar_sesiones(
     eliminar_miembros_path: Path | None = None,
     *,
     cargar_eliminar_miembros: bool = True,
+    agrupar_titulares: bool = True,
 ) -> list[dict]:
     lineas_links = leer_lineas_si_existe(links_path)
     lineas_emails = leer_lineas_utiles(emails_path)
@@ -1359,19 +1510,19 @@ def cargar_sesiones(
     if len(lineas_links) > n:
         print(
             f"Aviso: {links_path.name} tiene {len(lineas_links)} línea(s) y "
-            f"{emails_path.name} tiene {n} correo(s). Solo se abrirán {n} ventana(s) "
-            "(una por correo); las líneas sobrantes de LINKS no se usan."
+            f"{emails_path.name} tiene {n} correo(s). Solo se usarán {n} línea(s) de LINKS "
+            "(alineadas con cada correo); las sobrantes no se usan."
         )
     elif len(lineas_links) < n and lineas_links:
         print(
             f"Aviso: {links_path.name} tiene {len(lineas_links)} línea(s) y hay {n} correo(s). "
-            f"Las ventanas {len(lineas_links) + 1}–{n} usarán la URL de login por defecto y "
+            f"Las filas {len(lineas_links) + 1}–{n} usarán la URL de login por defecto y "
             "etiqueta «Perfil-N» en consola."
         )
     elif not lineas_links:
         print(
             f"Aviso: no hay entradas en '{links_path.name}' (vacío o ausente). "
-            f"Las {n} ventana(s) usarán la URL de login por defecto y «Perfil-1»…«Perfil-{n}»."
+            f"Las {n} fila(s) usarán la URL de login por defecto y «Perfil-1»…«Perfil-{n}»."
         )
 
     sesiones: list[dict] = []
@@ -1381,13 +1532,15 @@ def cargar_sesiones(
             url, perfil = parsear_linea_link(linea)
         else:
             url, perfil = DEFAULT_TIDAL_LOGIN_URL, f"Perfil-{i + 1}"
-        email = lineas_emails[i].strip()
+        email = normalizar_email_titular(lineas_emails[i])
         password = lineas_passwords[i].strip() if i < len(lineas_passwords) else ""
-        eliminar_miembro = lineas_eliminar[i].strip() if i < len(lineas_eliminar) else ""
+        eliminar_miembro = (
+            normalizar_email_titular(lineas_eliminar[i]) if i < len(lineas_eliminar) else ""
+        )
         if not email:
             print(
                 f"Aviso: línea {i + 1} de '{emails_path.name}' está vacía; "
-                f"esa ventana no tendrá correo para rellenar."
+                f"esa fila no tendrá correo para rellenar."
             )
         if not password:
             print(
@@ -1401,8 +1554,12 @@ def cargar_sesiones(
                 "email": email,
                 "password": password,
                 "eliminar_miembro": eliminar_miembro,
+                "eliminar_miembros": [eliminar_miembro] if eliminar_miembro else [],
             }
         )
+
+    if agrupar_titulares:
+        return agrupar_sesiones_por_titular(sesiones)
     return sesiones
 
 
@@ -1444,6 +1601,23 @@ def _detectar_captcha_uia(wnd) -> bool:
     except Exception:
         pass
     return False
+
+
+def _detectar_password_incorrecta_uia(wnd) -> str | None:
+    """Lee el árbol UIA buscando el aviso de contraseña/credenciales inválidas."""
+    try:
+        for d in wnd.descendants():
+            try:
+                name = d.element_info.name or ""
+                text = d.window_text() or ""
+            except Exception:
+                continue
+            blob = f"{name} {text}".strip()
+            if blob and _PASSWORD_INCORRECTA_RX.search(blob):
+                return _recortar_texto_error(blob)
+    except Exception:
+        pass
+    return None
 
 
 def _obtener_url_actual_uia(wnd) -> str:
@@ -2200,7 +2374,10 @@ def pulsar_iniciar_sesion(page) -> bool:
 
 
 def pulsar_iniciar_sesion_con_reintentos(page, intentos: int = 5, pausa_s: float = 0.08) -> bool:
+    """Pulsa Inicia sesión. Aborta si TIDAL indica contraseña incorrecta (no gasta más clics)."""
     for _ in range(intentos):
+        if texto_error_password_incorrecta(page):
+            return False
         if pulsar_iniciar_sesion(page):
             return True
         time.sleep(pausa_s)
@@ -2292,6 +2469,21 @@ _LOGIN_TID_ERROR_RX = re.compile(
     r"algo\s+salió\s+mal|something\s+went\s+wrong|inténtalo\s+de\s+nuevo|try\s+again",
     re.I,
 )
+_PASSWORD_INCORRECTA_RX = re.compile(
+    r"contrase[ñn]a\s+(es\s+)?incorrecta|"
+    r"incorrecta.{0,24}contrase[ñn]a|"
+    r"wrong\s+(e-?mail\s+or\s+)?password|"
+    r"incorrect\s+password|"
+    r"password\s+(is\s+)?incorrect|"
+    r"invalid\s+(e-?mail\s+or\s+)?password|"
+    r"invalid\s+credentials|"
+    r"credenciales?\s+(no\s+v[aá]lid[ao]s?|inv[aá]lid[ao]s?|incorrect[ao]s?)|"
+    r"(correo|e-?mail|usuario|username)\s+(o|or)\s+(la\s+)?(contrase[ñn]a|password).{0,40}incorrect|"
+    r"(contrase[ñn]a|password)\s+(o|or)\s+(el\s+)?(correo|e-?mail|usuario).{0,40}incorrect|"
+    r"bad\s+(user\s*name|email)\s+or\s+password|"
+    r"the\s+(e-?mail|password).{0,40}incorrect",
+    re.I,
+)
 _PASSWORD_SELECTORES = (
     'input[type="password"]',
     'input[name="password"]',
@@ -2303,6 +2495,129 @@ _PASSWORD_SELECTORES = (
     'input[placeholder*="password" i]',
     'input[data-testid*="password" i]',
 )
+
+
+def _recortar_texto_error(texto: str, max_len: int = 140) -> str:
+    s = re.sub(r"\s+", " ", (texto or "").strip())
+    if len(s) <= max_len:
+        return s
+    return s[: max_len - 1] + "…"
+
+
+def texto_error_password_incorrecta(page) -> str | None:
+    """
+    Si TIDAL muestra que la contraseña/credenciales son inválidas, devuelve el texto visible.
+    No cubre «Algo salió mal» (eso sigue siendo error genérico / antibot).
+    """
+    from playwright.sync_api import Error as PWErr
+    from playwright.sync_api import TimeoutError as PlaywrightTimeout
+
+    try:
+        if page.is_closed():
+            return None
+    except PWErr:
+        return None
+
+    def _texto_si_coincide(loc) -> str | None:
+        try:
+            n = loc.count()
+        except Exception:
+            return None
+        for i in range(min(n, 8)):
+            try:
+                el = loc.nth(i)
+                if not el.is_visible(timeout=350):
+                    continue
+                txt = (el.inner_text(timeout=800) or "").strip()
+                if txt and _PASSWORD_INCORRECTA_RX.search(txt):
+                    return _recortar_texto_error(txt)
+            except (PlaywrightTimeout, PWErr, Exception):
+                continue
+        return None
+
+    for frame in _frames_visibles(page):
+        try:
+            hallado = _texto_si_coincide(frame.get_by_text(_PASSWORD_INCORRECTA_RX))
+            if hallado:
+                return hallado
+        except (PlaywrightTimeout, PWErr, Exception):
+            pass
+        try:
+            hallado = _texto_si_coincide(frame.locator('[role="alert"], [aria-live="assertive"]'))
+            if hallado:
+                return hallado
+        except (PlaywrightTimeout, PWErr, Exception):
+            pass
+        try:
+            pwd_invalid = frame.locator(
+                'input[type="password"][aria-invalid="true"], '
+                'input[name="password"][aria-invalid="true"]'
+            )
+            if pwd_invalid.count():
+                # Mensaje asociado al campo (aria-describedby o error hermano).
+                for sel in (
+                    '[id][role="alert"]',
+                    '[data-testid*="error" i]',
+                    '[class*="error" i]',
+                    '[id*="error" i]',
+                ):
+                    hallado = _texto_si_coincide(frame.locator(sel))
+                    if hallado:
+                        return hallado
+                return "contraseña marcada como inválida (aria-invalid)"
+        except (PlaywrightTimeout, PWErr, Exception):
+            pass
+    return None
+
+
+def esperar_error_password_incorrecta(page, timeout_s: float = 3.5) -> str | None:
+    """Tras pulsar Inicia sesión: espera el error de credenciales o que salga del login."""
+    deadline = time.time() + max(0.4, float(timeout_s))
+    while time.time() < deadline:
+        detalle = texto_error_password_incorrecta(page)
+        if detalle:
+            return detalle
+        try:
+            if page.is_closed():
+                return None
+            if _es_pantalla_consentimiento(page):
+                return None
+            url = page.url or ""
+            if "captcha-delivery.com" in url:
+                return None
+            if not _es_pagina_login(page) and (
+                "account.tidal.com" in url or "listen.tidal.com" in url
+            ):
+                return None
+        except Exception:
+            pass
+        time.sleep(0.28)
+    return texto_error_password_incorrecta(page)
+
+
+def marcar_password_incorrecta(t: dict, detalle: str = "") -> None:
+    """Marca la ventana para no reintentar login ni seguir a Familia / eliminar miembros."""
+    t["password_incorrecta"] = True
+    if detalle:
+        t["password_incorrecta_detalle"] = detalle
+    n = t.get("n", "?")
+    perfil = t.get("perfil", "")
+    email = t.get("email", "")
+    extra = f" — {detalle}" if detalle else ""
+    print(
+        f"    [{n}] {perfil}: CONTRASEÑA INCORRECTA para «{email}»{extra}. "
+        "No se reintenta el login ni se continúan fases de esta ventana."
+    )
+
+
+def _omitir_por_password_incorrecta(t: dict, contexto: str = "") -> bool:
+    if not t.get("password_incorrecta"):
+        return False
+    if contexto:
+        n = t.get("n", "?")
+        perfil = t.get("perfil", "")
+        print(f"  [{n}] {perfil}: {contexto} (contraseña incorrecta).")
+    return True
 
 
 def _login_tid_muestra_error(page) -> bool:
@@ -2884,13 +3199,30 @@ def comprobar_y_reintentar_ventanas_fallidas(
     """
     Identifica las ventanas que no pudieron iniciar sesión (que siguen en la página de login o bloqueadas)
     y ofrece reintentar el login completo para ponerlas al día.
+    Las que fallaron por contraseña incorrecta no se reintentan.
     """
     from playwright.sync_api import Error as PWErr
     import sys
     import time
+
+    pwd_malas = [t for t in trabajos if t.get("password_incorrecta")]
+    if pwd_malas:
+        print(
+            f"\n⛔ {len(pwd_malas)} ventana(s) con CONTRASEÑA INCORRECTA "
+            "(no se reintenta el login):"
+        )
+        for t in pwd_malas:
+            detalle = t.get("password_incorrecta_detalle") or ""
+            extra = f" — {detalle}" if detalle else ""
+            print(
+                f"   • Ventana [{t['n']}] — {t['perfil']} "
+                f"({t.get('email', '')}){extra}"
+            )
     
     ventanas_fallidas = []
     for t in trabajos:
+        if t.get("password_incorrecta"):
+            continue
         page = t["page"]
         try:
             if page.is_closed():
@@ -2906,7 +3238,13 @@ def comprobar_y_reintentar_ventanas_fallidas(
             continue
             
     if not ventanas_fallidas:
-        print("\n✅ Todas las ventanas iniciaron sesión con éxito (página de login superada).")
+        if not pwd_malas:
+            print("\n✅ Todas las ventanas iniciaron sesión con éxito (página de login superada).")
+        else:
+            print(
+                "\n✅ El resto de ventanas iniciaron sesión "
+                "(salvo las omitidas por contraseña incorrecta)."
+            )
         return
         
     print(f"\n⚠️  Se detectaron {len(ventanas_fallidas)} ventana(s) que NO pudieron iniciar sesión:")
@@ -3283,6 +3621,7 @@ def ejecutar_playwright(
     delay_entre_eliminar_miembro: float = 0.25,
     usar_incognito: bool = False,
     cambiar_correo: bool = False,
+    lote_ventanas: int = DEFAULT_LOTE_VENTANAS,
 ) -> None:
     try:
         from playwright.sync_api import sync_playwright
@@ -3295,7 +3634,17 @@ def ejecutar_playwright(
         sys.exit(1)
 
     contextos_abiertos: list = []
-    total = len(sesiones)
+    todos_trabajos: list[dict] = []
+    total_global = len(sesiones)
+    lote_n = max(1, int(lote_ventanas)) if lote_ventanas and lote_ventanas > 0 else max(1, total_global)
+    lotes = partir_en_lotes(sesiones, lote_n)
+    if len(lotes) > 1:
+        print(
+            f"\nLotes de inicio de sesión: {len(lotes)} lote(s) × hasta {lote_n} ventana(s) "
+            f"(total {total_global}). Así se evita saturar la misma bandeja Gmail con OTP."
+        )
+    else:
+        print(f"\nVentanas a procesar: {total_global} (lote único).")
     with sync_playwright() as p:
         # Un solo Chrome + varios contextos: cada uno es una sesión privada aislada
         # (equivalente práctico a incógnito). Evita exitCode 21 por User Data bloqueado
@@ -3327,12 +3676,22 @@ def ejecutar_playwright(
 
         try:
             pm = _normalizar_pausa_manual(pausa_manual)
-            trabajos: list[dict] = []
-            for i, s in enumerate(sesiones):
-                url = s["url"]
-                perfil = s["perfil"]
-                email = s["email"]
-                print(f"\n[Fase 1 — abrir] [{i + 1}/{total}] {perfil}")
+            cfg_captcha = captcha_tid or CaptchaTidManejoCfg()
+            n_offset = 0
+            for idx_lote, sesiones_lote in enumerate(lotes):
+                total = len(sesiones_lote)
+                print(
+                    f"\n{'=' * 66}\n  LOTE {idx_lote + 1}/{len(lotes)} — "
+                    f"{total} ventana(s) "
+                    f"(titulares {n_offset + 1}–{n_offset + total} de {total_global})\n{'=' * 66}"
+                )
+                trabajos: list[dict] = []
+                for i, s in enumerate(sesiones_lote):
+                    url = s["url"]
+                    perfil = s["perfil"]
+                    email = s["email"]
+                    n_global = n_offset + i + 1
+                    print(f"\n[Fase 1 — abrir] [{n_global}/{total_global}] {perfil}")
 
                 try:
                     context = browser.new_context(
@@ -3402,6 +3761,7 @@ def ejecutar_playwright(
                 )
 
                 contextos_abiertos.append(context)
+                miembros = miembros_a_eliminar(s)
                 trabajos.append(
                     {
                         "page": page,
@@ -3409,329 +3769,394 @@ def ejecutar_playwright(
                         "email": email,
                         "password": s.get("password", ""),
                         "perfil": perfil,
-                        "n": i + 1,
-                        "eliminar_miembro": (s.get("eliminar_miembro") or "").strip(),
+                        "n": n_global,
+                        "eliminar_miembro": miembros[0] if miembros else "",
+                        "eliminar_miembros": miembros,
                         "url": url,
                         "url_familia": url_familia_tidal,
                     }
                 )
-                if i < total - 1 and delay_entre_aperturas > 0:
+                if i < len(sesiones_lote) - 1 and delay_entre_aperturas > 0:
                     time.sleep(delay_entre_aperturas)
 
-            if not contextos_abiertos and sesiones:
-                print("Ninguna sesión pudo abrirse con Playwright.")
-                return
-            if not trabajos:
-                return
-
-            cfg_captcha = captcha_tid or CaptchaTidManejoCfg()
-
-            print(
-                "\n  Última pasada de carga en cada pestaña (las primeras suelen haber terminado antes)…"
-            )
-            for t in trabajos:
-                try:
-                    _esperar_carga_post_goto_tid(
-                        t["page"],
-                        timeout_dom_ms=12_000,
-                        margen_s=min(0.42, max(0.12, espera_post_goto_cada_ventana_s * 0.4)),
-                    )
-                except Exception:
-                    pass
-
-            print(
-                f"\n[Fase 1 lista] {len(trabajos)} ventana(s). "
-                f"Pausa global {espera_tras_abrir_todas:g}s para iframes / formularios…"
-            )
-            time.sleep(espera_tras_abrir_todas)
-
-            if pm in ("solo-abrir", "abrir-y-cookies"):
-                pausa_manual_forzada("Tras abrir todas las ventanas (antes del correo)")
-
-            comprobar_captcha_post_fase(
-                trabajos,
-                "después de fase 1 — antes del correo",
-                pausa_s=0.18,
-                captcha_cfg=cfg_captcha,
-            )
-
-            print("\n=== Fase 2 — correo en cada ventana ===")
-            for t in trabajos:
-                perfil, email, page, n = t["perfil"], t["email"], t["page"], t["n"]
-                print(f"\n  [{n}/{total}] {perfil}")
-                if not email:
-                    print("  (sin correo en emails.txt para esta línea)")
-                    continue
-                if rellenar_email_con_reintentos(
-                    page,
-                    email,
-                    intentos=email_reintentos,
-                    pausa_s=email_pausa_s,
-                    fase_rapida=True,
-                ):
-                    print(f"  OK correo: {email}")
-                else:
+                if not trabajos:
                     print(
-                        f"  No se pudo rellenar: {email} "
-                        "(sube --email-reintentos o --espera-tras-abrir si falla a menudo)."
+                        f"  Lote {idx_lote + 1}/{len(lotes)}: ninguna sesión pudo abrirse. "
+                        "Se continúa con el siguiente lote si existe."
                     )
-
-            comprobar_captcha_post_fase(
-                trabajos, "después de fase 2 — correo", pausa_s=0.18, captcha_cfg=cfg_captcha
-            )
-
-            print("\n=== Fase 3 — cookies, una ventana tras otra ===")
-            for t in trabajos:
-                perfil, page, n = t["perfil"], t["page"], t["n"]
-                print(f"\n  [{n}/{total}] cookies — {perfil}")
-                if aceptar_cookies_con_espera(
-                    page,
-                    intentos=cookie_reintentos,
-                    pausa_s=cookie_pausa_s,
-                    esperar_networkidle=False,
-                ):
-                    print("  OK cookies (Aceptar o equivalente).")
-                else:
-                    print("  Sin banner reconocido o ya aceptado.")
-
-            print(
-                f"\nPausa {espera_tras_cookies_s:g}s tras cookies, antes de «Continuar»…"
-            )
-            time.sleep(espera_tras_cookies_s)
-
-            if pm in ("solo-cookies", "abrir-y-cookies"):
-                pausa_manual_forzada("Tras cookies (antes de «Continuar»)")
-
-            comprobar_captcha_post_fase(
-                trabajos, "después de fase 3 — cookies", pausa_s=0.18, captcha_cfg=cfg_captcha
-            )
-
-            print("\n=== Fase 4 — Continuar en cada ventana ===")
-            for t in trabajos:
-                perfil, page, n = t["perfil"], t["page"], t["n"]
-                print(f"\n  [{n}/{total}] Continuar — {perfil}")
-                if pulsar_continuar_con_reintentos(
-                    page,
-                    intentos=continuar_reintentos,
-                    pausa_s=continuar_pausa_s,
-                ):
-                    print("  OK «Continuar».")
-                else:
-                    print(
-                        "  No se encontró el botón Continuar habilitado "
-                        "(¿correo incompleto o otro idioma?)."
-                    )
-
-            comprobar_captcha_post_fase(
-                trabajos, "después de fase 4 — Continuar", pausa_s=0.18, captcha_cfg=cfg_captcha
-            )
-
-            espera_password_visible_s = max(espera_tras_continuar_s, 6.0)
-            print("\n  [Espera] Esperando 2 segundos tras finalizar el bloque de cuentas (correo)...")
-            time.sleep(2.0)
-
-            print("\n=== Fase 5 — contraseña en cada ventana (no se muestra en consola) ===")
-            for t in trabajos:
-                perfil, page, n, pwd = t["perfil"], t["page"], t["n"], t.get("password", "")
-                print(f"\n  [{n}/{total}] contraseña — {perfil}")
-                if not pwd:
-                    print("  (sin contraseña en passwords.txt para esta línea)")
+                    n_offset += len(sesiones_lote)
                     continue
-                
-                # Si el campo de contraseña no está visible, poner al día la ventana primero (en caso de reset por captcha)
-                if not esperar_campo_password(page, timeout_s=0.8):
-                    poner_ventana_al_dia(t, "password")
-                    
-                if not recuperar_pantalla_password_si_error(
-                    page,
-                    continuar_reintentos=min(continuar_reintentos, 6),
-                    continuar_pausa_s=continuar_pausa_s,
-                    espera_password_s=espera_password_visible_s,
-                ):
-                    if _login_tid_muestra_error(page):
-                        print(
-                            "  Error TIDAL («Algo salió mal»): no apareció el campo de contraseña."
-                        )
-                    else:
-                        print(
-                            "  No apareció el campo de contraseña a tiempo "
-                            f"(espera ~{espera_password_visible_s:g}s por ventana)."
-                        )
-                    continue
-                if rellenar_password_con_reintentos(
-                    page,
-                    pwd,
-                    intentos=password_reintentos,
-                    pausa_s=password_pausa_s,
-                    fase_rapida=True,
-                ):
-                    print("  OK contraseña escrita y verificada en el campo.")
-                else:
-                    print(
-                        "  No se pudo escribir o verificar la contraseña "
-                        "(sube --password-reintentos o revisa la ventana)."
-                    )
 
-            comprobar_captcha_post_fase(
-                trabajos, "después de fase 5 — contraseña", pausa_s=0.18, captcha_cfg=cfg_captcha
-            )
-
-            print(
-                f"\nPausa {espera_tras_password_s:g}s antes de «Inicia sesión» en todas las ventanas…"
-            )
-            time.sleep(espera_tras_password_s)
-
-            print("\n=== Fase 6 — Inicia sesión (rápido, ventana por ventana) ===")
-            for j, t in enumerate(trabajos):
-                perfil, page, n = t["perfil"], t["page"], t["n"]
-                print(f"  [{n}/{total}] Inicia sesión — {perfil}", flush=True)
-                
-                # Si la sesión se reinició por completo o se deslogueó
-                if not esperar_campo_password(page, timeout_s=0.5):
-                    if _es_pagina_login(page) or not ("account.tidal.com" in page.url or "listen.tidal.com" in page.url):
-                        poner_ventana_al_dia(t, "password")
-                        
-                if pulsar_iniciar_sesion_con_reintentos(
-                    page,
-                    intentos=iniciar_sesion_reintentos,
-                    pausa_s=iniciar_sesion_pausa_s,
-                ):
-                    print("    OK")
-                else:
-                    # Comprobar si ya está logueado
-                    if not _es_pagina_login(page):
-                        print("    OK (ya logueado)")
-                    else:
-                        print("    No encontrado o botón deshabilitado (revisa la ventana).")
-                
-                # Intentar pulsar 'Sí, continuar' si aparece la pantalla de consentimiento/autorización
-                print("    Esperando pantalla de consentimiento 'Sí, continuar'...")
-                if pulsar_si_continuar_auth(page, timeout_s=6.0):
-                    print("    OK 'Sí, continuar' pulsado o ya redirigido. Esperando carga y redirigiendo de frente a Familia...")
-                    time.sleep(3.0)
-                    url_fam = t.get("url_familia", DEFAULT_TIDAL_FAMILY_URL)
+                print(
+                    "\n  Última pasada de carga en cada pestaña (las primeras suelen haber terminado antes)…"
+                )
+                for t in trabajos:
                     try:
-                        page.goto(url_fam, wait_until="commit", timeout=25_000)
+                        _esperar_carga_post_goto_tid(
+                            t["page"],
+                            timeout_dom_ms=12_000,
+                            margen_s=min(0.42, max(0.12, espera_post_goto_cada_ventana_s * 0.4)),
+                        )
+                    except Exception:
+                        pass
+
+                print(
+                    f"\n[Fase 1 lista][Lote {idx_lote + 1}/{len(lotes)}] {len(trabajos)} ventana(s). "
+                    f"Pausa global {espera_tras_abrir_todas:g}s para iframes / formularios…"
+                )
+                time.sleep(espera_tras_abrir_todas)
+
+                if pm in ("solo-abrir", "abrir-y-cookies"):
+                    pausa_manual_forzada("Tras abrir todas las ventanas (antes del correo)")
+
+                comprobar_captcha_post_fase(
+                    trabajos,
+                    "después de fase 1 — antes del correo",
+                    pausa_s=0.18,
+                    captcha_cfg=cfg_captcha,
+                )
+
+                print("\n=== Fase 2 — correo en cada ventana ===")
+                for t in trabajos:
+                    perfil, email, page, n = t["perfil"], t["email"], t["page"], t["n"]
+                    print(f"\n  [{n}/{total_global}] {perfil}")
+                    if not email:
+                        print("  (sin correo en emails.txt para esta línea)")
+                        continue
+                    if rellenar_email_con_reintentos(
+                        page,
+                        email,
+                        intentos=email_reintentos,
+                        pausa_s=email_pausa_s,
+                        fase_rapida=True,
+                    ):
+                        print(f"  OK correo: {email}")
+                    else:
+                        print(
+                            f"  No se pudo rellenar: {email} "
+                            "(sube --email-reintentos o --espera-tras-abrir si falla a menudo)."
+                        )
+
+                comprobar_captcha_post_fase(
+                    trabajos, "después de fase 2 — correo", pausa_s=0.18, captcha_cfg=cfg_captcha
+                )
+
+                print("\n=== Fase 3 — cookies, una ventana tras otra ===")
+                for t in trabajos:
+                    perfil, page, n = t["perfil"], t["page"], t["n"]
+                    print(f"\n  [{n}/{total_global}] cookies — {perfil}")
+                    if aceptar_cookies_con_espera(
+                        page,
+                        intentos=cookie_reintentos,
+                        pausa_s=cookie_pausa_s,
+                        esperar_networkidle=False,
+                    ):
+                        print("  OK cookies (Aceptar o equivalente).")
+                    else:
+                        print("  Sin banner reconocido o ya aceptado.")
+
+                print(
+                    f"\nPausa {espera_tras_cookies_s:g}s tras cookies, antes de «Continuar»…"
+                )
+                time.sleep(espera_tras_cookies_s)
+
+                if pm in ("solo-cookies", "abrir-y-cookies"):
+                    pausa_manual_forzada("Tras cookies (antes de «Continuar»)")
+
+                comprobar_captcha_post_fase(
+                    trabajos, "después de fase 3 — cookies", pausa_s=0.18, captcha_cfg=cfg_captcha
+                )
+
+                print("\n=== Fase 4 — Continuar en cada ventana ===")
+                for t in trabajos:
+                    perfil, page, n = t["perfil"], t["page"], t["n"]
+                    print(f"\n  [{n}/{total_global}] Continuar — {perfil}")
+                    if pulsar_continuar_con_reintentos(
+                        page,
+                        intentos=continuar_reintentos,
+                        pausa_s=continuar_pausa_s,
+                    ):
+                        print("  OK «Continuar».")
+                    else:
+                        print(
+                            "  No se encontró el botón Continuar habilitado "
+                            "(¿correo incompleto o otro idioma?)."
+                        )
+
+                comprobar_captcha_post_fase(
+                    trabajos, "después de fase 4 — Continuar", pausa_s=0.18, captcha_cfg=cfg_captcha
+                )
+
+                espera_password_visible_s = max(espera_tras_continuar_s, 6.0)
+                print("\n  [Espera] Esperando 2 segundos tras finalizar el bloque de cuentas (correo)...")
+                time.sleep(2.0)
+
+                print("\n=== Fase 5 — contraseña en cada ventana (no se muestra en consola) ===")
+                for t in trabajos:
+                    perfil, page, n, pwd = t["perfil"], t["page"], t["n"], t.get("password", "")
+                    print(f"\n  [{n}/{total_global}] contraseña — {perfil}")
+                    if not pwd:
+                        print("  (sin contraseña en passwords.txt para esta línea)")
+                        continue
+                
+                    # Si el campo de contraseña no está visible, poner al día la ventana primero (en caso de reset por captcha)
+                    if not esperar_campo_password(page, timeout_s=0.8):
+                        poner_ventana_al_dia(t, "password")
+                    
+                    if not recuperar_pantalla_password_si_error(
+                        page,
+                        continuar_reintentos=min(continuar_reintentos, 6),
+                        continuar_pausa_s=continuar_pausa_s,
+                        espera_password_s=espera_password_visible_s,
+                    ):
+                        if _login_tid_muestra_error(page):
+                            print(
+                                "  Error TIDAL («Algo salió mal»): no apareció el campo de contraseña."
+                            )
+                        else:
+                            print(
+                                "  No apareció el campo de contraseña a tiempo "
+                                f"(espera ~{espera_password_visible_s:g}s por ventana)."
+                            )
+                        continue
+                    if rellenar_password_con_reintentos(
+                        page,
+                        pwd,
+                        intentos=password_reintentos,
+                        pausa_s=password_pausa_s,
+                        fase_rapida=True,
+                    ):
+                        print("  OK contraseña escrita y verificada en el campo.")
+                    else:
+                        print(
+                            "  No se pudo escribir o verificar la contraseña "
+                            "(sube --password-reintentos o revisa la ventana)."
+                        )
+
+                comprobar_captcha_post_fase(
+                    trabajos, "después de fase 5 — contraseña", pausa_s=0.18, captcha_cfg=cfg_captcha
+                )
+
+                print(
+                    f"\nPausa {espera_tras_password_s:g}s antes de «Inicia sesión» en todas las ventanas…"
+                )
+                time.sleep(espera_tras_password_s)
+
+                print("\n=== Fase 6 — Inicia sesión (rápido, ventana por ventana) ===")
+                for j, t in enumerate(trabajos):
+                    perfil, page, n = t["perfil"], t["page"], t["n"]
+                    print(f"  [{n}/{total_global}] Inicia sesión — {perfil}", flush=True)
+                    if _omitir_por_password_incorrecta(t):
+                        print("    Omitida: contraseña incorrecta.")
+                        continue
+                
+                    # Si la sesión se reinició por completo o se deslogueó
+                    if not esperar_campo_password(page, timeout_s=0.5):
+                        if _es_pagina_login(page) or not ("account.tidal.com" in page.url or "listen.tidal.com" in page.url):
+                            poner_ventana_al_dia(t, "password")
+                            if t.get("password_incorrecta"):
+                                continue
+                        
+                    if pulsar_iniciar_sesion_con_reintentos(
+                        page,
+                        intentos=iniciar_sesion_reintentos,
+                        pausa_s=iniciar_sesion_pausa_s,
+                    ):
+                        print("    OK")
+                    else:
+                        # Comprobar si ya está logueado
+                        if not _es_pagina_login(page):
+                            print("    OK (ya logueado)")
+                        else:
+                            print("    No encontrado o botón deshabilitado (revisa la ventana).")
+
+                    detalle_pwd = esperar_error_password_incorrecta(page, timeout_s=3.5)
+                    if detalle_pwd:
+                        marcar_password_incorrecta(t, detalle_pwd)
+                        if j < len(trabajos) - 1 and delay_entre_iniciar_sesion > 0:
+                            time.sleep(delay_entre_iniciar_sesion)
+                        continue
+                
+                    # Intentar pulsar 'Sí, continuar' si aparece la pantalla de consentimiento/autorización
+                    print("    Esperando pantalla de consentimiento 'Sí, continuar'...")
+                    if pulsar_si_continuar_auth(page, timeout_s=6.0):
+                        print("    OK 'Sí, continuar' pulsado o ya redirigido. Esperando carga y redirigiendo de frente a Familia...")
+                        time.sleep(3.0)
+                        url_fam = t.get("url_familia", DEFAULT_TIDAL_FAMILY_URL)
+                        try:
+                            page.goto(url_fam, wait_until="commit", timeout=25_000)
+                        except Exception:
+                            try:
+                                page.goto(url_fam, wait_until="domcontentloaded", timeout=20_000)
+                            except Exception:
+                                pass
+                    else:
+                        print("    No se requirió o no se encontró 'Sí, continuar'.")
+
+                    if j < len(trabajos) - 1 and delay_entre_iniciar_sesion > 0:
+                        time.sleep(delay_entre_iniciar_sesion)
+
+                pwd_malas_lote = [t for t in trabajos if t.get("password_incorrecta")]
+                if pwd_malas_lote:
+                    print(
+                        f"\n  ⛔ Lote: {len(pwd_malas_lote)} titular(es) con contraseña incorrecta; "
+                        "no se reintenta ni se avanza a Familia/eliminar miembros:"
+                    )
+                    for t in pwd_malas_lote:
+                        print(f"     • [{t['n']}] {t.get('email', '')} — {t['perfil']}")
+
+                comprobar_captcha_post_fase(
+                    trabajos,
+                    "después de fase 6 — Inicia sesión",
+                    pausa_s=0.2,
+                    captcha_cfg=cfg_captcha,
+                )
+
+                print("\n  [Espera] Esperando 2 segundos tras finalizar el bloque de iniciar sesión...")
+                time.sleep(2.0)
+
+                print("\n=== Fase 7 — página Familia TIDAL (rápido, ventana por ventana) ===")
+                print(f"  URL: {url_familia_tidal}")
+                for j, t in enumerate(trabajos):
+                    perfil, page, n = t["perfil"], t["page"], t["n"]
+                    print(f"  [{n}/{total_global}] familia — {perfil}", flush=True)
+                    if _omitir_por_password_incorrecta(t, "omitida en Familia"):
+                        continue
+                
+                    # Si se cerró la sesión o se reinició por completo
+                    if _es_pagina_login(page) or not ("account.tidal.com" in page.url or "listen.tidal.com" in page.url):
+                        print(f"    [{n}] {perfil}: Sesión cerrada o fuera de cuenta. Iniciando sesión de nuevo...")
+                        poner_ventana_al_dia(t, "iniciar_sesion")
+                        if t.get("password_incorrecta"):
+                            continue
+                    
+                    try:
+                        page.goto(url_familia_tidal, wait_until="commit", timeout=45_000)
                     except Exception:
                         try:
-                            page.goto(url_fam, wait_until="domcontentloaded", timeout=20_000)
-                        except Exception:
-                            pass
-                else:
-                    print("    No se requirió o no se encontró 'Sí, continuar'.")
-
-                if j < len(trabajos) - 1 and delay_entre_iniciar_sesion > 0:
-                    time.sleep(delay_entre_iniciar_sesion)
-
-            comprobar_captcha_post_fase(
-                trabajos,
-                "después de fase 6 — Inicia sesión",
-                pausa_s=0.2,
-                captcha_cfg=cfg_captcha,
-            )
-
-            print("\n  [Espera] Esperando 2 segundos tras finalizar el bloque de iniciar sesión...")
-            time.sleep(2.0)
-
-            print("\n=== Fase 7 — página Familia TIDAL (rápido, ventana por ventana) ===")
-            print(f"  URL: {url_familia_tidal}")
-            for j, t in enumerate(trabajos):
-                perfil, page, n = t["perfil"], t["page"], t["n"]
-                print(f"  [{n}/{total}] familia — {perfil}", flush=True)
-                
-                # Si se cerró la sesión o se reinició por completo
-                if _es_pagina_login(page) or not ("account.tidal.com" in page.url or "listen.tidal.com" in page.url):
-                    print(f"    [{n}] {perfil}: Sesión cerrada o fuera de cuenta. Iniciando sesión de nuevo...")
-                    poner_ventana_al_dia(t, "iniciar_sesion")
-                    
-                try:
-                    page.goto(url_familia_tidal, wait_until="commit", timeout=45_000)
-                except Exception:
-                    try:
-                        page.goto(url_familia_tidal, wait_until="domcontentloaded", timeout=45_000)
-                    except Exception as e_nav:
-                        print(f"    Error: {e_nav}")
-                if j < len(trabajos) - 1 and delay_entre_familia > 0:
-                    time.sleep(delay_entre_familia)
-
-            comprobar_captcha_post_fase(
-                trabajos,
-                "después de fase 7 — página Familia",
-                pausa_s=0.25,
-                captcha_cfg=cfg_captcha,
-            )
-
-            if not omitir_fase_eliminar_miembros and any(
-                (t.get("eliminar_miembro") or "").strip() for t in trabajos
-            ):
-                print(
-                    "\n=== Fase 8 — eliminar miembro del plan Familiar ==="
-                )
-                for j, t in enumerate(trabajos):
-                    perfil, page, n = t["perfil"], t["page"], t["n"]
-                    emiem = (t.get("eliminar_miembro") or "").strip()
-                    if not emiem:
-                        print(f"  [{n}/{total}] {perfil}: (sin correo a eliminar en esta línea del archivo)")
-                        continue
-                    print(f"  [{n}/{total}] {perfil} — eliminar miembro: {emiem}", flush=True)
-                    try:
-                        if page.is_closed():
-                            print("    pestaña cerrada, omitida.")
-                            continue
-                        if eliminar_miembro_plan_familiar_con_reintentos(
-                            page,
-                            emiem,
-                            intentos=eliminar_miembro_reintentos,
-                            pausa_s=eliminar_miembro_pausa_s,
-                        ):
-                            print(
-                                "    OK: se pulsó confirmar eliminación; "
-                                "verifica en TIDAL que el miembro ya no figure en la lista."
-                            )
-                        else:
-                            print(
-                                "    No se pudo completar (¿lista distinta, idioma o ya eliminado?)."
-                            )
-                    except Exception as e:
-                        print(f"    Error: {e}")
-                    if j < len(trabajos) - 1 and delay_entre_eliminar_miembro > 0:
-                        time.sleep(delay_entre_eliminar_miembro)
+                            page.goto(url_familia_tidal, wait_until="domcontentloaded", timeout=45_000)
+                        except Exception as e_nav:
+                            print(f"    Error: {e_nav}")
+                    if j < len(trabajos) - 1 and delay_entre_familia > 0:
+                        time.sleep(delay_entre_familia)
 
                 comprobar_captcha_post_fase(
                     trabajos,
-                    "después de fase 8 — eliminar miembro",
-                    pausa_s=0.3,
+                    "después de fase 7 — página Familia",
+                    pausa_s=0.25,
                     captcha_cfg=cfg_captcha,
                 )
 
-            if cambiar_correo:
-                print("\n=== Fase 8B — cambiar correo de información del perfil ===")
-                for j, t in enumerate(trabajos):
-                    perfil, page, n = t["perfil"], t["page"], t["n"]
-                    email_con_puntos = generar_correo_con_puntos("cakeseller1234@gmail.com")
-                    print(f"  [{n}/{total}] {perfil} — Cambiando correo a: {email_con_puntos}", flush=True)
-                    try:
-                        if page.is_closed():
-                            print("    pestaña cerrada, omitida.")
+                if not omitir_fase_eliminar_miembros and any(
+                    miembros_a_eliminar(t) for t in trabajos
+                ):
+                    print(
+                        "\n=== Fase 8 — eliminar miembro(s) del plan Familiar ==="
+                    )
+                    for j, t in enumerate(trabajos):
+                        perfil, page, n = t["perfil"], t["page"], t["n"]
+                        if _omitir_por_password_incorrecta(t, "omitida en eliminar miembros"):
                             continue
-                        if cambiar_correo_perfil_playwright(page, email_con_puntos):
-                            print("    OK: correo cambiado.")
-                        else:
-                            print("    No se pudo completar el cambio de correo.")
-                    except Exception as e:
-                        print(f"    Error: {e}")
-                    if j < len(trabajos) - 1:
-                        time.sleep(1.0)
+                        lista_m = miembros_a_eliminar(t)
+                        if not lista_m:
+                            print(
+                                f"  [{n}/{total_global}] {perfil}: "
+                                "(sin correos a eliminar en esta ventana)"
+                            )
+                            continue
+                        print(
+                            f"  [{n}/{total_global}] {perfil} — "
+                            f"{len(lista_m)} miembro(s) a eliminar en esta ventana",
+                            flush=True,
+                        )
+                        try:
+                            if page.is_closed():
+                                print("    pestaña cerrada, omitida.")
+                                continue
+                            for k, emiem in enumerate(lista_m, start=1):
+                                print(f"    ({k}/{len(lista_m)}) eliminar: {emiem}", flush=True)
+                                if eliminar_miembro_plan_familiar_con_reintentos(
+                                    page,
+                                    emiem,
+                                    intentos=eliminar_miembro_reintentos,
+                                    pausa_s=eliminar_miembro_pausa_s,
+                                ):
+                                    print(
+                                        "      OK: se pulsó confirmar eliminación; "
+                                        "verifica en TIDAL que el miembro ya no figure."
+                                    )
+                                else:
+                                    print(
+                                        "      No se pudo completar "
+                                        "(¿lista distinta, idioma o ya eliminado?)."
+                                    )
+                                if k < len(lista_m) and delay_entre_eliminar_miembro > 0:
+                                    time.sleep(delay_entre_eliminar_miembro)
+                                # Volver a familia por si la UI cambió tras eliminar
+                                if k < len(lista_m):
+                                    try:
+                                        page.goto(
+                                            t.get("url_familia", url_familia_tidal),
+                                            wait_until="domcontentloaded",
+                                            timeout=25_000,
+                                        )
+                                        time.sleep(max(0.3, eliminar_miembro_pausa_s))
+                                    except Exception:
+                                        pass
+                        except Exception as e:
+                            print(f"    Error: {e}")
+                        if j < len(trabajos) - 1 and delay_entre_eliminar_miembro > 0:
+                            time.sleep(delay_entre_eliminar_miembro)
 
-                comprobar_captcha_post_fase(
-                    trabajos,
-                    "después de fase 8B — cambiar correo",
-                    pausa_s=0.3,
-                    captcha_cfg=cfg_captcha,
-                )
+                    comprobar_captcha_post_fase(
+                        trabajos,
+                        "después de fase 8 — eliminar miembro",
+                        pausa_s=0.3,
+                        captcha_cfg=cfg_captcha,
+                    )
+
+                if cambiar_correo:
+                    print("\n=== Fase 8B — cambiar correo de información del perfil ===")
+                    for j, t in enumerate(trabajos):
+                        perfil, page, n = t["perfil"], t["page"], t["n"]
+                        if _omitir_por_password_incorrecta(t, "omitida en cambiar correo"):
+                            continue
+                        email_con_puntos = generar_correo_con_puntos("cakeseller1234@gmail.com")
+                        print(f"  [{n}/{total_global}] {perfil} — Cambiando correo a: {email_con_puntos}", flush=True)
+                        try:
+                            if page.is_closed():
+                                print("    pestaña cerrada, omitida.")
+                                continue
+                            if cambiar_correo_perfil_playwright(page, email_con_puntos):
+                                print("    OK: correo cambiado.")
+                            else:
+                                print("    No se pudo completar el cambio de correo.")
+                        except Exception as e:
+                            print(f"    Error: {e}")
+                        if j < len(trabajos) - 1:
+                            time.sleep(1.0)
+
+                    comprobar_captcha_post_fase(
+                        trabajos,
+                        "después de fase 8B — cambiar correo",
+                        pausa_s=0.3,
+                        captcha_cfg=cfg_captcha,
+                    )
+
+                todos_trabajos.extend(trabajos)
+                n_offset += len(sesiones_lote)
+                if idx_lote < len(lotes) - 1:
+                    print(
+                        f"\n--- Lote {idx_lote + 1}/{len(lotes)} terminado. "
+                        "Resuelve códigos OTP / captchas de este lote antes del siguiente. ---"
+                    )
+                    pausa_manual_forzada(
+                        f"Entre lotes ({idx_lote + 1}→{idx_lote + 2} de {len(lotes)})",
+                        segundos_sin_tty=45.0,
+                    )
 
             # Opcional: Barrido final para verificar e intentar loguear las ventanas que fallaron
-            comprobar_y_reintentar_ventanas_fallidas(trabajos, url_familia_tidal, cfg_captcha)
+            comprobar_y_reintentar_ventanas_fallidas(todos_trabajos, url_familia_tidal, cfg_captcha)
 
             print(
                 "\nListo. Revisa cada ventana por si TIDAL pide un paso extra (captcha, 2FA, etc.).\n"
@@ -3765,10 +4190,10 @@ def ejecutar_playwright(
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Abre TIDAL en Chrome (ventanas privadas): una ventana por correo en emails.txt, "
-            "login automatizado, página Familia y opcionalmente fase 8 para eliminar un miembro del plan. "
-            "LINKS.txt alinea URL/perfil por línea (opcional: menos líneas que correos = URL por defecto). "
-            "Playwright no usa perfiles reales de Chrome."
+            "Abre TIDAL en Chrome (ventanas privadas): agrupa el mismo titular en una ventana "
+            "(varios miembros a eliminar), inicia sesión por lotes (por defecto 5) para no saturar "
+            "Gmail/OTP, login automatizado, página Familia y opcionalmente fase 8 para eliminar miembros. "
+            "LINKS.txt alinea URL/perfil por línea (opcional). Playwright no usa perfiles reales de Chrome."
         )
     )
     parser.add_argument(
@@ -3791,8 +4216,9 @@ def main() -> None:
         type=Path,
         default=DEFAULT_EMAILS_FILE,
         help=(
-            f"Un correo por línea: define cuántas ventanas se abren (por defecto: {DEFAULT_EMAILS_FILE.name}). "
-            "Cada línea alinea contraseña, LINKS y eliminar-miembros en la misma posición."
+            f"Un correo titular por línea (por defecto: {DEFAULT_EMAILS_FILE.name}). "
+            "Filas con el mismo titular se fusionan en una ventana; cada línea alinea "
+            "contraseña, LINKS y miembro a eliminar en la misma posición."
         ),
     )
     parser.add_argument(
@@ -4042,6 +4468,27 @@ def main() -> None:
         dest="delay_eliminar_miembro",
         help="Fase 8: pausa entre ventana y ventana (por defecto 0.25).",
     )
+    parser.add_argument(
+        "--lote-ventanas",
+        type=int,
+        default=DEFAULT_LOTE_VENTANAS,
+        dest="lote_ventanas",
+        metavar="N",
+        help=(
+            f"Cuántas ventanas iniciar a la vez (por defecto {DEFAULT_LOTE_VENTANAS}). "
+            "Reduce saturación de OTP cuando varios titulares comparten bandeja Gmail (puntos). "
+            "Usa 0 o un número muy alto para un solo lote con todas."
+        ),
+    )
+    parser.add_argument(
+        "--sin-agrupar-titulares",
+        action="store_true",
+        dest="sin_agrupar_titulares",
+        help=(
+            "No fusionar filas del mismo correo titular. Por defecto sí se agrupan: "
+            "una ventana por titular y todos sus miembros a eliminar en esa ventana."
+        ),
+    )
     args = parser.parse_args()
 
     # Opción interactiva al inicio
@@ -4074,11 +4521,14 @@ def main() -> None:
         args.passwords,
         eliminar_miembros_path=args.eliminar_miembros,
         cargar_eliminar_miembros=not args.omitir_fase_eliminar_miembros,
+        agrupar_titulares=not args.sin_agrupar_titulares,
     )
     if not sesiones:
         sys.exit(1)
 
-    print(f"Entradas: {len(sesiones)}")
+    print(f"Ventanas (tras agrupar titulares): {len(sesiones)}")
+    if args.lote_ventanas and args.lote_ventanas > 0:
+        print(f"Tamaño de lote de inicio de sesión: {args.lote_ventanas}")
 
     if args.solo_subprocess:
         # Intentar importar pywinauto
@@ -4108,9 +4558,11 @@ def main() -> None:
             email = s["email"]
             password = s["password"]
             url = s["url"]
-            eliminar_miembro = s.get("eliminar_miembro", "").strip()
+            lista_eliminar = miembros_a_eliminar(s)
             
             print(f"\n--- [{i + 1}/{len(sesiones)}] Iniciando y conectando perfil: {perfil} ({email}) ---")
+            if lista_eliminar:
+                print(f"  Miembros a eliminar en esta ventana: {len(lista_eliminar)}")
             
             # Aplicar bypass de referencia cargando la página principal / pricing de TIDAL primero
             usar_bypass_referencia = (url == DEFAULT_TIDAL_LOGIN_URL or "tidal.com/pricing" in url or "account.tidal.com" in url)
@@ -4179,6 +4631,7 @@ def main() -> None:
             intentos_login = 0
             necesita_bypass = usar_bypass_referencia
             ya_logueado = False
+            password_incorrecta_uia = False
             
             # Comprobar si ya está logueada
             url_actual = _obtener_url_actual_uia(wnd)
@@ -4188,6 +4641,8 @@ def main() -> None:
 
             if not ya_logueado:
                 while intentos_login < 5:
+                    if password_incorrecta_uia:
+                        break
                     # 1. Comprobar si hay un captcha de DataDome o bloqueo de entrada
                     if _detectar_captcha_uia(wnd):
                         print("\n  ⚠️ [BLOQUEO / RESTRICCIÓN DE IP] Se ha detectado una pantalla de bloqueo.")
@@ -4363,6 +4818,16 @@ def main() -> None:
                     time.sleep(random.uniform(0.7, 1.3))
                     wnd.type_keys("{ENTER}")
 
+                time.sleep(1.4)
+                detalle_pwd_uia = _detectar_password_incorrecta_uia(wnd)
+                if detalle_pwd_uia:
+                    print(
+                        f"  ⛔ CONTRASEÑA INCORRECTA para «{email}» — {detalle_pwd_uia}. "
+                        "No se reintenta el login ni se continúa Familia/eliminar miembros."
+                    )
+                    password_incorrecta_uia = True
+                    break
+
                 # Intentar pulsar 'Sí, continuar' si aparece la pantalla de consentimiento/autorización
                 print("  Esperando pantalla de consentimiento 'Sí, continuar'...")
                 if _pulsar_si_continuar_auth_uia(wnd, timeout_s=6.0):
@@ -4406,7 +4871,9 @@ def main() -> None:
                 
                 break
 
-            if not ya_logueado:
+            if password_incorrecta_uia:
+                print("  Omitiendo Familia / eliminar miembros / cambiar correo (contraseña incorrecta).")
+            elif not ya_logueado:
                 # 6. Esperar a que se realice el login
                 print("  Esperando inicio de sesión (5s)...")
                 time.sleep(5.0)
@@ -4428,7 +4895,7 @@ def main() -> None:
                 time.sleep(4.0)
             else:
                 # Si ya está logueado, y la fase 8 está activa (no omitida), asegurar que vamos a familia
-                if eliminar_miembro and not args.omitir_fase_eliminar_miembros:
+                if lista_eliminar and not args.omitir_fase_eliminar_miembros:
                     url_fam = args.url_familia_tidal or DEFAULT_TIDAL_FAMILY_URL
                     url_actual = _obtener_url_actual_uia(wnd)
                     if "family" not in url_actual:
@@ -4438,16 +4905,37 @@ def main() -> None:
                         wnd.type_keys(url_fam + "{ENTER}", with_spaces=True)
                         time.sleep(4.0)
 
-            # 8. Eliminar miembro si aplica
-            if eliminar_miembro and not args.omitir_fase_eliminar_miembros:
-                print(f"  [Fase 8] Intentando eliminar miembro del plan familiar: {eliminar_miembro}")
-                if _eliminar_miembro_uia(wnd, eliminar_miembro):
-                    print("  ✅ Miembro eliminado correctamente.")
-                else:
-                    print("  ⚠️ No se pudo eliminar al miembro de manera automática. Revisa la ventana.")
+            # 8. Eliminar miembro(s) si aplica
+            if (
+                lista_eliminar
+                and not args.omitir_fase_eliminar_miembros
+                and not password_incorrecta_uia
+            ):
+                print(
+                    f"  [Fase 8] Eliminando {len(lista_eliminar)} miembro(s) del plan familiar…"
+                )
+                for k, eliminar_miembro in enumerate(lista_eliminar, start=1):
+                    print(f"    ({k}/{len(lista_eliminar)}) {eliminar_miembro}")
+                    if _eliminar_miembro_uia(wnd, eliminar_miembro):
+                        print("      ✅ Miembro eliminado correctamente.")
+                    else:
+                        print(
+                            "      ⚠️ No se pudo eliminar al miembro de manera automática. "
+                            "Revisa la ventana."
+                        )
+                    if k < len(lista_eliminar):
+                        time.sleep(max(0.4, args.eliminar_miembro_pausa))
+                        url_fam = args.url_familia_tidal or DEFAULT_TIDAL_FAMILY_URL
+                        try:
+                            wnd.type_keys("^l")
+                            time.sleep(0.2)
+                            wnd.type_keys(url_fam + "{ENTER}", with_spaces=True)
+                            time.sleep(3.0)
+                        except Exception:
+                            pass
 
             # 8B. Cambiar correo de la cuenta si aplica
-            if args.cambiar_correo:
+            if args.cambiar_correo and not password_incorrecta_uia:
                 email_con_puntos = generar_correo_con_puntos("cakeseller1234@gmail.com")
                 print(f"  [Fase 8B] Cambiando correo del perfil a: {email_con_puntos}")
                 if cambiar_correo_perfil_uia(wnd, email_con_puntos):
@@ -4502,6 +4990,11 @@ def main() -> None:
         delay_entre_eliminar_miembro=args.delay_eliminar_miembro,
         usar_incognito=args.usar_incognito,
         cambiar_correo=args.cambiar_correo,
+        lote_ventanas=(
+            len(sesiones)
+            if not args.lote_ventanas or args.lote_ventanas <= 0
+            else args.lote_ventanas
+        ),
     )
 
 
