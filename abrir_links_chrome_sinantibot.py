@@ -625,6 +625,9 @@ def detectar_error_cloudfront_403(page) -> bool:
 
 
 def _motivo_bloqueo_tid(page) -> str | None:
+    # Contraseña incorrecta no es antibot ni 403: no pedir rotar IP ni recargar.
+    if texto_error_password_incorrecta(page):
+        return None
     if detectar_pantalla_antirobot_tid(page):
         return "antibot"
     if detectar_error_cloudfront_403(page):
@@ -858,11 +861,19 @@ def poner_ventana_al_dia(t, fase_objetivo: str, max_iteraciones: int = 10) -> bo
     
     target_val = orden_fases.get(fase_objetivo, 1)
     
+    if t.get("password_incorrecta"):
+        return False
+
     for iteracion in range(max_iteraciones):
         try:
             if page.is_closed():
                 return False
         except PWErr:
+            return False
+
+        detalle_pwd = texto_error_password_incorrecta(page)
+        if detalle_pwd:
+            marcar_password_incorrecta(t, detalle_pwd)
             return False
             
         # 1. Si hay captcha, error 403 o bloqueo, no podemos avanzar esta ventana aún
@@ -938,6 +949,10 @@ def poner_ventana_al_dia(t, fase_objetivo: str, max_iteraciones: int = 10) -> bo
             if password:
                 rellenar_password_con_reintentos(page, password, intentos=2, fase_rapida=True)
                 pulsar_iniciar_sesion_con_reintentos(page, intentos=2, pausa_s=0.2)
+                detalle_pwd = esperar_error_password_incorrecta(page, timeout_s=3.0)
+                if detalle_pwd:
+                    marcar_password_incorrecta(t, detalle_pwd)
+                    return False
             time.sleep(1.0)  # Tiempo de transición/login
             
         elif current_fase == "iniciar_sesion":
@@ -994,6 +1009,12 @@ def verificar_y_reintentar_fase_anterior(
                 continue
         except PWErr:
             print(f"    [{n}] {perfil}: ❌ Error al acceder a la pestaña")
+            continue
+
+        if t.get("password_incorrecta"):
+            print(
+                f"    [{n}] {perfil}: omitida (contraseña incorrecta; no se reintenta el login)."
+            )
             continue
         
         # Verificar si aún hay bloqueos
@@ -1580,6 +1601,23 @@ def _detectar_captcha_uia(wnd) -> bool:
     except Exception:
         pass
     return False
+
+
+def _detectar_password_incorrecta_uia(wnd) -> str | None:
+    """Lee el árbol UIA buscando el aviso de contraseña/credenciales inválidas."""
+    try:
+        for d in wnd.descendants():
+            try:
+                name = d.element_info.name or ""
+                text = d.window_text() or ""
+            except Exception:
+                continue
+            blob = f"{name} {text}".strip()
+            if blob and _PASSWORD_INCORRECTA_RX.search(blob):
+                return _recortar_texto_error(blob)
+    except Exception:
+        pass
+    return None
 
 
 def _obtener_url_actual_uia(wnd) -> str:
@@ -2336,7 +2374,10 @@ def pulsar_iniciar_sesion(page) -> bool:
 
 
 def pulsar_iniciar_sesion_con_reintentos(page, intentos: int = 5, pausa_s: float = 0.08) -> bool:
+    """Pulsa Inicia sesión. Aborta si TIDAL indica contraseña incorrecta (no gasta más clics)."""
     for _ in range(intentos):
+        if texto_error_password_incorrecta(page):
+            return False
         if pulsar_iniciar_sesion(page):
             return True
         time.sleep(pausa_s)
@@ -2428,6 +2469,21 @@ _LOGIN_TID_ERROR_RX = re.compile(
     r"algo\s+salió\s+mal|something\s+went\s+wrong|inténtalo\s+de\s+nuevo|try\s+again",
     re.I,
 )
+_PASSWORD_INCORRECTA_RX = re.compile(
+    r"contrase[ñn]a\s+(es\s+)?incorrecta|"
+    r"incorrecta.{0,24}contrase[ñn]a|"
+    r"wrong\s+(e-?mail\s+or\s+)?password|"
+    r"incorrect\s+password|"
+    r"password\s+(is\s+)?incorrect|"
+    r"invalid\s+(e-?mail\s+or\s+)?password|"
+    r"invalid\s+credentials|"
+    r"credenciales?\s+(no\s+v[aá]lid[ao]s?|inv[aá]lid[ao]s?|incorrect[ao]s?)|"
+    r"(correo|e-?mail|usuario|username)\s+(o|or)\s+(la\s+)?(contrase[ñn]a|password).{0,40}incorrect|"
+    r"(contrase[ñn]a|password)\s+(o|or)\s+(el\s+)?(correo|e-?mail|usuario).{0,40}incorrect|"
+    r"bad\s+(user\s*name|email)\s+or\s+password|"
+    r"the\s+(e-?mail|password).{0,40}incorrect",
+    re.I,
+)
 _PASSWORD_SELECTORES = (
     'input[type="password"]',
     'input[name="password"]',
@@ -2439,6 +2495,129 @@ _PASSWORD_SELECTORES = (
     'input[placeholder*="password" i]',
     'input[data-testid*="password" i]',
 )
+
+
+def _recortar_texto_error(texto: str, max_len: int = 140) -> str:
+    s = re.sub(r"\s+", " ", (texto or "").strip())
+    if len(s) <= max_len:
+        return s
+    return s[: max_len - 1] + "…"
+
+
+def texto_error_password_incorrecta(page) -> str | None:
+    """
+    Si TIDAL muestra que la contraseña/credenciales son inválidas, devuelve el texto visible.
+    No cubre «Algo salió mal» (eso sigue siendo error genérico / antibot).
+    """
+    from playwright.sync_api import Error as PWErr
+    from playwright.sync_api import TimeoutError as PlaywrightTimeout
+
+    try:
+        if page.is_closed():
+            return None
+    except PWErr:
+        return None
+
+    def _texto_si_coincide(loc) -> str | None:
+        try:
+            n = loc.count()
+        except Exception:
+            return None
+        for i in range(min(n, 8)):
+            try:
+                el = loc.nth(i)
+                if not el.is_visible(timeout=350):
+                    continue
+                txt = (el.inner_text(timeout=800) or "").strip()
+                if txt and _PASSWORD_INCORRECTA_RX.search(txt):
+                    return _recortar_texto_error(txt)
+            except (PlaywrightTimeout, PWErr, Exception):
+                continue
+        return None
+
+    for frame in _frames_visibles(page):
+        try:
+            hallado = _texto_si_coincide(frame.get_by_text(_PASSWORD_INCORRECTA_RX))
+            if hallado:
+                return hallado
+        except (PlaywrightTimeout, PWErr, Exception):
+            pass
+        try:
+            hallado = _texto_si_coincide(frame.locator('[role="alert"], [aria-live="assertive"]'))
+            if hallado:
+                return hallado
+        except (PlaywrightTimeout, PWErr, Exception):
+            pass
+        try:
+            pwd_invalid = frame.locator(
+                'input[type="password"][aria-invalid="true"], '
+                'input[name="password"][aria-invalid="true"]'
+            )
+            if pwd_invalid.count():
+                # Mensaje asociado al campo (aria-describedby o error hermano).
+                for sel in (
+                    '[id][role="alert"]',
+                    '[data-testid*="error" i]',
+                    '[class*="error" i]',
+                    '[id*="error" i]',
+                ):
+                    hallado = _texto_si_coincide(frame.locator(sel))
+                    if hallado:
+                        return hallado
+                return "contraseña marcada como inválida (aria-invalid)"
+        except (PlaywrightTimeout, PWErr, Exception):
+            pass
+    return None
+
+
+def esperar_error_password_incorrecta(page, timeout_s: float = 3.5) -> str | None:
+    """Tras pulsar Inicia sesión: espera el error de credenciales o que salga del login."""
+    deadline = time.time() + max(0.4, float(timeout_s))
+    while time.time() < deadline:
+        detalle = texto_error_password_incorrecta(page)
+        if detalle:
+            return detalle
+        try:
+            if page.is_closed():
+                return None
+            if _es_pantalla_consentimiento(page):
+                return None
+            url = page.url or ""
+            if "captcha-delivery.com" in url:
+                return None
+            if not _es_pagina_login(page) and (
+                "account.tidal.com" in url or "listen.tidal.com" in url
+            ):
+                return None
+        except Exception:
+            pass
+        time.sleep(0.28)
+    return texto_error_password_incorrecta(page)
+
+
+def marcar_password_incorrecta(t: dict, detalle: str = "") -> None:
+    """Marca la ventana para no reintentar login ni seguir a Familia / eliminar miembros."""
+    t["password_incorrecta"] = True
+    if detalle:
+        t["password_incorrecta_detalle"] = detalle
+    n = t.get("n", "?")
+    perfil = t.get("perfil", "")
+    email = t.get("email", "")
+    extra = f" — {detalle}" if detalle else ""
+    print(
+        f"    [{n}] {perfil}: CONTRASEÑA INCORRECTA para «{email}»{extra}. "
+        "No se reintenta el login ni se continúan fases de esta ventana."
+    )
+
+
+def _omitir_por_password_incorrecta(t: dict, contexto: str = "") -> bool:
+    if not t.get("password_incorrecta"):
+        return False
+    if contexto:
+        n = t.get("n", "?")
+        perfil = t.get("perfil", "")
+        print(f"  [{n}] {perfil}: {contexto} (contraseña incorrecta).")
+    return True
 
 
 def _login_tid_muestra_error(page) -> bool:
@@ -3020,13 +3199,30 @@ def comprobar_y_reintentar_ventanas_fallidas(
     """
     Identifica las ventanas que no pudieron iniciar sesión (que siguen en la página de login o bloqueadas)
     y ofrece reintentar el login completo para ponerlas al día.
+    Las que fallaron por contraseña incorrecta no se reintentan.
     """
     from playwright.sync_api import Error as PWErr
     import sys
     import time
+
+    pwd_malas = [t for t in trabajos if t.get("password_incorrecta")]
+    if pwd_malas:
+        print(
+            f"\n⛔ {len(pwd_malas)} ventana(s) con CONTRASEÑA INCORRECTA "
+            "(no se reintenta el login):"
+        )
+        for t in pwd_malas:
+            detalle = t.get("password_incorrecta_detalle") or ""
+            extra = f" — {detalle}" if detalle else ""
+            print(
+                f"   • Ventana [{t['n']}] — {t['perfil']} "
+                f"({t.get('email', '')}){extra}"
+            )
     
     ventanas_fallidas = []
     for t in trabajos:
+        if t.get("password_incorrecta"):
+            continue
         page = t["page"]
         try:
             if page.is_closed():
@@ -3042,7 +3238,13 @@ def comprobar_y_reintentar_ventanas_fallidas(
             continue
             
     if not ventanas_fallidas:
-        print("\n✅ Todas las ventanas iniciaron sesión con éxito (página de login superada).")
+        if not pwd_malas:
+            print("\n✅ Todas las ventanas iniciaron sesión con éxito (página de login superada).")
+        else:
+            print(
+                "\n✅ El resto de ventanas iniciaron sesión "
+                "(salvo las omitidas por contraseña incorrecta)."
+            )
         return
         
     print(f"\n⚠️  Se detectaron {len(ventanas_fallidas)} ventana(s) que NO pudieron iniciar sesión:")
@@ -3744,11 +3946,16 @@ def ejecutar_playwright(
                 for j, t in enumerate(trabajos):
                     perfil, page, n = t["perfil"], t["page"], t["n"]
                     print(f"  [{n}/{total_global}] Inicia sesión — {perfil}", flush=True)
+                    if _omitir_por_password_incorrecta(t):
+                        print("    Omitida: contraseña incorrecta.")
+                        continue
                 
                     # Si la sesión se reinició por completo o se deslogueó
                     if not esperar_campo_password(page, timeout_s=0.5):
                         if _es_pagina_login(page) or not ("account.tidal.com" in page.url or "listen.tidal.com" in page.url):
                             poner_ventana_al_dia(t, "password")
+                            if t.get("password_incorrecta"):
+                                continue
                         
                     if pulsar_iniciar_sesion_con_reintentos(
                         page,
@@ -3762,6 +3969,13 @@ def ejecutar_playwright(
                             print("    OK (ya logueado)")
                         else:
                             print("    No encontrado o botón deshabilitado (revisa la ventana).")
+
+                    detalle_pwd = esperar_error_password_incorrecta(page, timeout_s=3.5)
+                    if detalle_pwd:
+                        marcar_password_incorrecta(t, detalle_pwd)
+                        if j < len(trabajos) - 1 and delay_entre_iniciar_sesion > 0:
+                            time.sleep(delay_entre_iniciar_sesion)
+                        continue
                 
                     # Intentar pulsar 'Sí, continuar' si aparece la pantalla de consentimiento/autorización
                     print("    Esperando pantalla de consentimiento 'Sí, continuar'...")
@@ -3782,6 +3996,15 @@ def ejecutar_playwright(
                     if j < len(trabajos) - 1 and delay_entre_iniciar_sesion > 0:
                         time.sleep(delay_entre_iniciar_sesion)
 
+                pwd_malas_lote = [t for t in trabajos if t.get("password_incorrecta")]
+                if pwd_malas_lote:
+                    print(
+                        f"\n  ⛔ Lote: {len(pwd_malas_lote)} titular(es) con contraseña incorrecta; "
+                        "no se reintenta ni se avanza a Familia/eliminar miembros:"
+                    )
+                    for t in pwd_malas_lote:
+                        print(f"     • [{t['n']}] {t.get('email', '')} — {t['perfil']}")
+
                 comprobar_captcha_post_fase(
                     trabajos,
                     "después de fase 6 — Inicia sesión",
@@ -3797,11 +4020,15 @@ def ejecutar_playwright(
                 for j, t in enumerate(trabajos):
                     perfil, page, n = t["perfil"], t["page"], t["n"]
                     print(f"  [{n}/{total_global}] familia — {perfil}", flush=True)
+                    if _omitir_por_password_incorrecta(t, "omitida en Familia"):
+                        continue
                 
                     # Si se cerró la sesión o se reinició por completo
                     if _es_pagina_login(page) or not ("account.tidal.com" in page.url or "listen.tidal.com" in page.url):
                         print(f"    [{n}] {perfil}: Sesión cerrada o fuera de cuenta. Iniciando sesión de nuevo...")
                         poner_ventana_al_dia(t, "iniciar_sesion")
+                        if t.get("password_incorrecta"):
+                            continue
                     
                     try:
                         page.goto(url_familia_tidal, wait_until="commit", timeout=45_000)
@@ -3828,6 +4055,8 @@ def ejecutar_playwright(
                     )
                     for j, t in enumerate(trabajos):
                         perfil, page, n = t["perfil"], t["page"], t["n"]
+                        if _omitir_por_password_incorrecta(t, "omitida en eliminar miembros"):
+                            continue
                         lista_m = miembros_a_eliminar(t)
                         if not lista_m:
                             print(
@@ -3890,6 +4119,8 @@ def ejecutar_playwright(
                     print("\n=== Fase 8B — cambiar correo de información del perfil ===")
                     for j, t in enumerate(trabajos):
                         perfil, page, n = t["perfil"], t["page"], t["n"]
+                        if _omitir_por_password_incorrecta(t, "omitida en cambiar correo"):
+                            continue
                         email_con_puntos = generar_correo_con_puntos("cakeseller1234@gmail.com")
                         print(f"  [{n}/{total_global}] {perfil} — Cambiando correo a: {email_con_puntos}", flush=True)
                         try:
@@ -4400,6 +4631,7 @@ def main() -> None:
             intentos_login = 0
             necesita_bypass = usar_bypass_referencia
             ya_logueado = False
+            password_incorrecta_uia = False
             
             # Comprobar si ya está logueada
             url_actual = _obtener_url_actual_uia(wnd)
@@ -4409,6 +4641,8 @@ def main() -> None:
 
             if not ya_logueado:
                 while intentos_login < 5:
+                    if password_incorrecta_uia:
+                        break
                     # 1. Comprobar si hay un captcha de DataDome o bloqueo de entrada
                     if _detectar_captcha_uia(wnd):
                         print("\n  ⚠️ [BLOQUEO / RESTRICCIÓN DE IP] Se ha detectado una pantalla de bloqueo.")
@@ -4584,6 +4818,16 @@ def main() -> None:
                     time.sleep(random.uniform(0.7, 1.3))
                     wnd.type_keys("{ENTER}")
 
+                time.sleep(1.4)
+                detalle_pwd_uia = _detectar_password_incorrecta_uia(wnd)
+                if detalle_pwd_uia:
+                    print(
+                        f"  ⛔ CONTRASEÑA INCORRECTA para «{email}» — {detalle_pwd_uia}. "
+                        "No se reintenta el login ni se continúa Familia/eliminar miembros."
+                    )
+                    password_incorrecta_uia = True
+                    break
+
                 # Intentar pulsar 'Sí, continuar' si aparece la pantalla de consentimiento/autorización
                 print("  Esperando pantalla de consentimiento 'Sí, continuar'...")
                 if _pulsar_si_continuar_auth_uia(wnd, timeout_s=6.0):
@@ -4627,7 +4871,9 @@ def main() -> None:
                 
                 break
 
-            if not ya_logueado:
+            if password_incorrecta_uia:
+                print("  Omitiendo Familia / eliminar miembros / cambiar correo (contraseña incorrecta).")
+            elif not ya_logueado:
                 # 6. Esperar a que se realice el login
                 print("  Esperando inicio de sesión (5s)...")
                 time.sleep(5.0)
@@ -4660,7 +4906,11 @@ def main() -> None:
                         time.sleep(4.0)
 
             # 8. Eliminar miembro(s) si aplica
-            if lista_eliminar and not args.omitir_fase_eliminar_miembros:
+            if (
+                lista_eliminar
+                and not args.omitir_fase_eliminar_miembros
+                and not password_incorrecta_uia
+            ):
                 print(
                     f"  [Fase 8] Eliminando {len(lista_eliminar)} miembro(s) del plan familiar…"
                 )
@@ -4685,7 +4935,7 @@ def main() -> None:
                             pass
 
             # 8B. Cambiar correo de la cuenta si aplica
-            if args.cambiar_correo:
+            if args.cambiar_correo and not password_incorrecta_uia:
                 email_con_puntos = generar_correo_con_puntos("cakeseller1234@gmail.com")
                 print(f"  [Fase 8B] Cambiando correo del perfil a: {email_con_puntos}")
                 if cambiar_correo_perfil_uia(wnd, email_con_puntos):
